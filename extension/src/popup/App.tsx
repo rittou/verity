@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import type {
+  AnalysisDiagnostics,
   AnalysisModelOption,
   ArticleData,
   AnalysisResult,
@@ -15,7 +16,7 @@ type AppState =
   | "analyzing"
   | "done"
   | "error"
-  | "quota"
+  | "limit"
   | "no-article";
 
 export default function App() {
@@ -29,39 +30,58 @@ export default function App() {
     ModelScoreComparisonEntry[]
   >([]);
   const [analysisStartedAt, setAnalysisStartedAt] = useState<number | undefined>();
+  const [limitDetails, setLimitDetails] = useState<AnalysisDiagnostics | null>(null);
+  const [previousScore, setPreviousScore] = useState<ModelScoreComparisonEntry | null>(null);
+  const [previousCachedResult, setPreviousCachedResult] = useState<AnalysisResult | null>(
+    null,
+  );
 
-  const loadModelComparisons = async (articleData: ArticleData | null) => {
-    if (!articleData) {
-      setModelComparisons([]);
-      return;
-    }
+  const fetchModelComparisons = async (
+    articleData: ArticleData | null,
+  ): Promise<ModelScoreComparisonEntry[]> => {
+    if (!articleData) return [];
     try {
       const response = await chrome.runtime.sendMessage({
         type: "GET_MODEL_SCORE_COMPARISON",
         data: articleData,
       });
-      const comparisons = Array.isArray(response?.comparisons)
+      return Array.isArray(response?.comparisons)
         ? (response.comparisons as ModelScoreComparisonEntry[])
         : [];
-      setModelComparisons(comparisons);
     } catch {
-      setModelComparisons([]);
+      return [];
     }
+  };
+
+  const loadModelComparisons = async (articleData: ArticleData | null) => {
+    if (!articleData) {
+      setModelComparisons([]);
+      return [];
+    }
+    const comparisons = await fetchModelComparisons(articleData);
+    setModelComparisons(comparisons);
+    return comparisons;
   };
 
   const handleAnalysisResponse = async (
     response: {
-    type?: string;
-    data?: AnalysisResult;
-    error?: string;
-    code?: string;
-  },
+      type?: string;
+      data?: AnalysisResult;
+      error?: string;
+      code?: string;
+      details?: AnalysisDiagnostics;
+    },
     articleForComparison: ArticleData | null,
   ) => {
     if (response?.type === "ANALYSIS_ERROR") {
-      if (response.code === "QUOTA_EXCEEDED") {
-        setError(response.error || "Model quota exceeded");
-        setState("quota");
+      if (
+        response.code === "MODEL_LIMIT_REACHED" ||
+        response.code === "QUOTA_EXCEEDED"
+      ) {
+        setError(response.error || "The model provider limited this request.");
+        setLimitDetails(response.details || null);
+        console.warn("[Verity] Model limit details", response.details || {});
+        setState("limit");
         return;
       }
       throw new Error(response.error || "Analysis failed");
@@ -72,6 +92,15 @@ export default function App() {
     }
 
     setResult(response.data);
+    setLimitDetails(null);
+    setPreviousCachedResult(response.data);
+    setPreviousScore({
+      modelId: response.data.analysisModel || selectedModel,
+      analysisModel: response.data.analysisModel || selectedModel,
+      trustScore: response.data.trustScore,
+      grade: response.data.grade,
+      analyzedAt: response.data.analyzedAt,
+    });
     setState("done");
     await loadModelComparisons(articleForComparison);
 
@@ -141,12 +170,25 @@ export default function App() {
       ) {
         setArticle(extractedArticle);
         setError("No model is configured on the proxy. Add at least one API key.");
+        setLimitDetails(null);
         setState("error");
         return;
       }
 
       if (extractedArticle) {
         setArticle(extractedArticle);
+        const comparisons = await loadModelComparisons(extractedArticle);
+        const latestComparison =
+          comparisons.length > 0
+            ? [...comparisons].sort(
+                (a, b) =>
+                  new Date(b.analyzedAt).getTime() -
+                  new Date(a.analyzedAt).getTime(),
+              )[0]
+            : null;
+        setPreviousScore(latestComparison);
+        setPreviousCachedResult(null);
+
         const status = await chrome.runtime
           .sendMessage({
             type: "GET_ANALYSIS_STATUS",
@@ -169,10 +211,15 @@ export default function App() {
         }
 
         if (status?.cached) {
-          setResult(status.cached as AnalysisResult);
-          setState("done");
-          await loadModelComparisons(extractedArticle);
-          return;
+          const cachedResult = status.cached as AnalysisResult;
+          setPreviousCachedResult(cachedResult);
+          setPreviousScore({
+            modelId: cachedResult.analysisModel || initialModel,
+            analysisModel: cachedResult.analysisModel || initialModel,
+            trustScore: cachedResult.trustScore,
+            grade: cachedResult.grade,
+            analyzedAt: cachedResult.analyzedAt,
+          });
         }
 
         setState("idle");
@@ -190,6 +237,7 @@ export default function App() {
     setState("analyzing");
     setResult(null);
     setModelComparisons([]);
+    setLimitDetails(null);
     setError("");
 
     try {
@@ -214,6 +262,24 @@ export default function App() {
     (result?.analysisModel &&
       models.find((m) => m.id === result.analysisModel)?.label) ||
     result?.analysisModel;
+  const labelForModel = (modelId: string) =>
+    models.find((m) => m.id === modelId)?.label || modelId;
+  const formatAttemptTime = (attemptedAt: string) =>
+    new Date(attemptedAt).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  const shortAttemptReason = (attempt: {
+    limitType?: string;
+    outcome: "success" | "limit" | "error";
+  }) => {
+    if (attempt.limitType === "quota_confirmed") return "Quota reached";
+    if (attempt.limitType === "rate_limited") return "Rate limit hit";
+    if (attempt.limitType === "limit_unknown") return "Provider returned 429";
+    if (attempt.outcome === "error") return "Request failed";
+    return "Completed";
+  };
   const modelComparisonRows = modelComparisons.map((row) => ({
     ...row,
     modelLabel:
@@ -318,6 +384,11 @@ export default function App() {
               <p className="text-[11px] text-zinc-600 mt-1">
                 {article.body.length.toLocaleString()} chars extracted
               </p>
+              <p className="text-[11px] text-zinc-600 mt-1">
+                {article.mediaSummary?.imageCount || 0} images,{" "}
+                {article.mediaSummary?.videoCount || 0} videos detected.
+                Analysis currently uses text only.
+              </p>
             </div>
             <button
               onClick={() => analyze()}
@@ -326,6 +397,35 @@ export default function App() {
             >
               Analyze for Misinformation
             </button>
+            {previousScore && (
+              <div className="p-3 bg-zinc-900/70 rounded-xl border border-zinc-800/70">
+                <p className="text-[10px] uppercase tracking-widest text-zinc-600 font-semibold">
+                  Previous Score
+                </p>
+                <div className="flex items-baseline justify-between gap-3 mt-2">
+                  <p className="text-sm font-semibold text-zinc-200">
+                    {previousScore.trustScore}/100 ({previousScore.grade})
+                  </p>
+                  <p className="text-[11px] text-zinc-500">
+                    {labelForModel(previousScore.analysisModel || previousScore.modelId)}
+                  </p>
+                </div>
+                <p className="text-[11px] text-zinc-500 mt-1.5">
+                  {new Date(previousScore.analyzedAt).toLocaleString()}
+                </p>
+                {previousCachedResult && (
+                  <button
+                    onClick={() => {
+                      setResult(previousCachedResult);
+                      setState("done");
+                    }}
+                    className="mt-2 text-[11px] text-emerald-400 hover:text-emerald-300 transition-colors"
+                  >
+                    View previous report
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -350,26 +450,50 @@ export default function App() {
           </div>
         )}
 
-        {state === "quota" && (
+        {state === "limit" && (
           <div className="flex-1 flex flex-col items-center justify-center gap-4 px-6">
             <div className="p-3 bg-amber-950/30 rounded-full">
               <Clock className="w-8 h-8 text-amber-400" />
             </div>
             <p className="text-sm text-amber-300 text-center font-semibold">
-              Model Limit Reached
+              Provider Limit Reached
             </p>
             <p className="text-xs text-zinc-400 text-center leading-relaxed">
-              Your selected model hit rate limits or daily quota.
-              Try another model or wait for quota reset.
+              {error || "The model provider blocked this request."}
             </p>
             <div className="w-full p-3 bg-zinc-900 rounded-xl border border-zinc-800 text-xs text-zinc-500 leading-relaxed">
               <p className="font-medium text-zinc-400 mb-1">Options:</p>
               <ul className="list-disc list-inside space-y-1">
-                <li>Wait for quota reset</li>
+                <li>Retry after a short wait if it looks like a burst rate limit</li>
                 <li>Switch to another configured model</li>
-                <li>Upgrade API plan for higher limits</li>
+                <li>Upgrade or replenish the provider plan if quota is confirmed</li>
               </ul>
             </div>
+            {limitDetails?.attempts?.length ? (
+              <div className="w-full p-3 bg-zinc-900 rounded-xl border border-zinc-800">
+                <p className="text-[10px] uppercase tracking-widest text-zinc-600 font-semibold mb-2">
+                  Attempt Log
+                </p>
+                <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                  {limitDetails.attempts.map((attempt) => {
+                    return (
+                      <div
+                        key={`${attempt.modelId}-${attempt.attemptedAt}-${attempt.outcome}`}
+                        className="rounded-lg border border-zinc-800/80 bg-zinc-950/70 px-2.5 py-2"
+                      >
+                        <p className="text-[11px] text-zinc-300 font-medium">
+                          {labelForModel(attempt.modelId)}
+                        </p>
+                        <p className="text-[11px] text-zinc-500 mt-1 leading-relaxed">
+                          {formatAttemptTime(attempt.attemptedAt)} ·{" "}
+                          {shortAttemptReason(attempt)}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
             <div className="w-full">
               {renderModelPicker(true)}
             </div>

@@ -4,6 +4,12 @@ export interface ArticleData {
   body: string;
   siteName?: string;
   publishedDate?: string;
+  mediaSummary?: MediaSummary;
+}
+
+export interface MediaSummary {
+  imageCount: number;
+  videoCount: number;
 }
 
 export interface Claim {
@@ -41,6 +47,8 @@ export interface AnalysisResult {
   summary: string;
   analyzedAt: string;
   analysisModel?: string;
+  analysisScope?: AnalysisScope;
+  diagnostics?: AnalysisDiagnostics;
 }
 
 export interface ModelScoreComparisonEntry {
@@ -58,6 +66,40 @@ export interface AnalysisModelOption {
   available: boolean;
 }
 
+export type ModelProvider = "gemini" | "openai" | "openrouter";
+
+export type ModelLimitType =
+  | "quota_confirmed"
+  | "rate_limited"
+  | "limit_unknown";
+
+export interface ModelAttemptDiagnostic {
+  modelId: string;
+  provider: ModelProvider;
+  outcome: "success" | "limit" | "error";
+  stage?: "claim_decomposition" | "claim_evaluation" | "tone_detection";
+  message: string;
+  attemptedAt: string;
+  httpStatus?: number;
+  providerCode?: string;
+  requestId?: string;
+  retryAfterSeconds?: number;
+  limitType?: ModelLimitType;
+}
+
+export interface AnalysisDiagnostics {
+  attempts: ModelAttemptDiagnostic[];
+}
+
+export interface AnalysisScope {
+  articleTextIncluded: boolean;
+  imagesDetected: number;
+  videosDetected: number;
+  imagesAnalyzed: boolean;
+  videosAnalyzed: boolean;
+  note: string;
+}
+
 export type ExtensionMessage =
   | { type: "GET_ARTICLE_DATA" }
   | { type: "ARTICLE_DATA"; data: ArticleData }
@@ -69,7 +111,7 @@ export type ExtensionMessage =
       analysisModel?: string;
     }
   | { type: "ANALYSIS_RESULT"; data: AnalysisResult }
-  | { type: "ANALYSIS_ERROR"; error: string }
+  | { type: "ANALYSIS_ERROR"; error: string; code?: string; details?: AnalysisDiagnostics }
   | { type: "SHOW_OVERLAY"; data: AnalysisResult }
   | { type: "REMOVE_OVERLAY" }
   | { type: "GET_MODEL_SCORE_COMPARISON"; data: ArticleData }

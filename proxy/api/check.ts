@@ -4,7 +4,13 @@ interface ArticleInput {
   url: string;
   title: string;
   body: string;
+  mediaSummary?: MediaSummary;
   analysisModel?: string;
+}
+
+interface MediaSummary {
+  imageCount: number;
+  videoCount: number;
 }
 
 interface Claim {
@@ -30,6 +36,14 @@ interface ToneAlert {
 }
 
 type ModelProvider = "gemini" | "openai" | "openrouter";
+type AnalysisStage =
+  | "claim_decomposition"
+  | "claim_evaluation"
+  | "tone_detection";
+type ModelLimitType =
+  | "quota_confirmed"
+  | "rate_limited"
+  | "limit_unknown";
 
 interface ModelConfig {
   id: string;
@@ -44,6 +58,7 @@ interface LlmCallOpts {
   jsonSchema?: Record<string, unknown>;
   temperature?: number;
   maxOutputTokens?: number;
+  stage?: AnalysisStage;
 }
 
 interface LlmResponse {
@@ -58,6 +73,41 @@ interface ClaimEvaluation {
   rationale: string;
   fallacies: string;
   sources: { title: string; url: string; authority: number }[];
+}
+
+interface AnalysisScope {
+  articleTextIncluded: boolean;
+  imagesDetected: number;
+  videosDetected: number;
+  imagesAnalyzed: boolean;
+  videosAnalyzed: boolean;
+  note: string;
+}
+
+interface ModelAttemptDiagnostic {
+  modelId: string;
+  provider: ModelProvider;
+  outcome: "success" | "limit" | "error";
+  stage?: AnalysisStage;
+  message: string;
+  attemptedAt: string;
+  httpStatus?: number;
+  providerCode?: string;
+  requestId?: string;
+  retryAfterSeconds?: number;
+  limitType?: ModelLimitType;
+}
+
+interface AnalysisDiagnostics {
+  attempts: ModelAttemptDiagnostic[];
+}
+
+interface ProviderErrorPayload {
+  rawBody: string;
+  providerMessage: string;
+  providerCode?: string;
+  requestId?: string;
+  retryAfterSeconds?: number;
 }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
@@ -164,17 +214,268 @@ const AUTHORITY_DOMAINS: Record<string, number> = {
   "wikipedia.org": 0.7,
 };
 
-class QuotaExceededError extends Error {
-  code = "QUOTA_EXCEEDED";
-  constructor(provider: ModelProvider) {
-    super(
-      provider === "openai"
-        ? "OpenAI quota/rate limit exceeded. Try another model or upgrade plan."
-        : provider === "openrouter"
-          ? "OpenRouter free model rate limit reached. Try another model or retry in a minute."
-          : "Gemini API daily quota exceeded (free tier limit). Try another model or retry later.",
-    );
+class ModelLimitError extends Error {
+  code = "MODEL_LIMIT_REACHED";
+  readonly limitType: ModelLimitType;
+  readonly provider: ModelProvider;
+  readonly modelId: string;
+  readonly stage?: AnalysisStage;
+  readonly httpStatus: number;
+  readonly providerCode?: string;
+  readonly requestId?: string;
+  readonly retryAfterSeconds?: number;
+
+  constructor(input: {
+    provider: ModelProvider;
+    modelId: string;
+    stage?: AnalysisStage;
+    httpStatus: number;
+    limitType: ModelLimitType;
+    providerCode?: string;
+    providerMessage?: string;
+    requestId?: string;
+    retryAfterSeconds?: number;
+  }) {
+    super(buildLimitMessage(input.provider, input.limitType, input.providerMessage));
+    this.limitType = input.limitType;
+    this.provider = input.provider;
+    this.modelId = input.modelId;
+    this.stage = input.stage;
+    this.httpStatus = input.httpStatus;
+    this.providerCode = input.providerCode;
+    this.requestId = input.requestId;
+    this.retryAfterSeconds = input.retryAfterSeconds;
   }
+
+  toDiagnostic(): ModelAttemptDiagnostic {
+    return {
+      modelId: this.modelId,
+      provider: this.provider,
+      outcome: "limit",
+      stage: this.stage,
+      message: this.message,
+      attemptedAt: new Date().toISOString(),
+      httpStatus: this.httpStatus,
+      providerCode: this.providerCode,
+      requestId: this.requestId,
+      retryAfterSeconds: this.retryAfterSeconds,
+      limitType: this.limitType,
+    };
+  }
+}
+
+function providerLabel(provider: ModelProvider): string {
+  if (provider === "openai") return "OpenAI";
+  if (provider === "openrouter") return "OpenRouter";
+  return "Gemini";
+}
+
+function buildLimitMessage(
+  provider: ModelProvider,
+  limitType: ModelLimitType,
+  providerMessage?: string,
+): string {
+  const label = providerLabel(provider);
+  const suffix = providerMessage ? ` Provider said: ${providerMessage}` : "";
+
+  if (limitType === "quota_confirmed") {
+    return `${label} confirmed that this request is out of quota.${suffix}`;
+  }
+
+  if (limitType === "rate_limited") {
+    return `${label} rate-limited this request.${suffix}`;
+  }
+
+  return `${label} returned HTTP 429, but it did not clearly confirm quota exhaustion versus a temporary rate limit.${suffix}`;
+}
+
+function truncateForLog(input: string, maxLen = 500): string {
+  if (input.length <= maxLen) return input;
+  return `${input.slice(0, maxLen)}…`;
+}
+
+function parseJsonSafely(input: string): unknown {
+  try {
+    return JSON.parse(input);
+  } catch {
+    return null;
+  }
+}
+
+function getObjectValue(
+  value: unknown,
+  key: string,
+): unknown {
+  if (!value || typeof value !== "object") return undefined;
+  return (value as Record<string, unknown>)[key];
+}
+
+function extractProviderMessage(parsedBody: unknown, rawBody: string): string {
+  const directMessage = getObjectValue(parsedBody, "message");
+  if (typeof directMessage === "string" && directMessage.trim()) {
+    return directMessage.trim();
+  }
+
+  const errorValue = getObjectValue(parsedBody, "error");
+  if (typeof errorValue === "string" && errorValue.trim()) {
+    return errorValue.trim();
+  }
+
+  const errorMessage = getObjectValue(errorValue, "message");
+  if (typeof errorMessage === "string" && errorMessage.trim()) {
+    return errorMessage.trim();
+  }
+
+  return rawBody.trim();
+}
+
+function extractProviderCode(parsedBody: unknown): string | undefined {
+  const directCode = getObjectValue(parsedBody, "code");
+  if (typeof directCode === "string" && directCode.trim()) {
+    return directCode.trim();
+  }
+
+  const errorValue = getObjectValue(parsedBody, "error");
+  const errorCode = getObjectValue(errorValue, "code");
+  if (typeof errorCode === "string" && errorCode.trim()) {
+    return errorCode.trim();
+  }
+
+  const errorType = getObjectValue(errorValue, "type");
+  if (typeof errorType === "string" && errorType.trim()) {
+    return errorType.trim();
+  }
+
+  const errorStatus = getObjectValue(errorValue, "status");
+  if (typeof errorStatus === "string" && errorStatus.trim()) {
+    return errorStatus.trim();
+  }
+
+  return undefined;
+}
+
+function parseRetryAfterSeconds(value: string | null): number | undefined {
+  if (!value) return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    return numeric;
+  }
+
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) return undefined;
+
+  return Math.max(0, Math.ceil((timestamp - Date.now()) / 1000));
+}
+
+function classifyLimitType(
+  providerCode: string | undefined,
+  providerMessage: string,
+  rawBody: string,
+): ModelLimitType {
+  const haystack = `${providerCode || ""} ${providerMessage} ${rawBody}`.toLowerCase();
+
+  if (
+    /insufficient_quota|quota|daily limit|billing|credit balance|payment required/.test(
+      haystack,
+    )
+  ) {
+    return "quota_confirmed";
+  }
+
+  if (/rate limit|rate_limit|too many requests|retry after/.test(haystack)) {
+    return "rate_limited";
+  }
+
+  return "limit_unknown";
+}
+
+async function readProviderErrorPayload(
+  res: Response,
+): Promise<ProviderErrorPayload> {
+  const rawBody = await res.text();
+  const parsedBody = parseJsonSafely(rawBody);
+  return {
+    rawBody,
+    providerMessage: extractProviderMessage(parsedBody, rawBody),
+    providerCode: extractProviderCode(parsedBody),
+    requestId:
+      res.headers.get("x-request-id") ||
+      res.headers.get("request-id") ||
+      res.headers.get("x-vercel-id") ||
+      undefined,
+    retryAfterSeconds: parseRetryAfterSeconds(res.headers.get("retry-after")),
+  };
+}
+
+function createModelLimitError(input: {
+  provider: ModelProvider;
+  modelId: string;
+  stage?: AnalysisStage;
+  res: Response;
+  payload: ProviderErrorPayload;
+}): ModelLimitError {
+  const { provider, modelId, stage, res, payload } = input;
+  const limitType = classifyLimitType(
+    payload.providerCode,
+    payload.providerMessage,
+    payload.rawBody,
+  );
+
+  console.warn("[Verity][provider-limit]", {
+    provider,
+    modelId,
+    stage,
+    httpStatus: res.status,
+    limitType,
+    providerCode: payload.providerCode,
+    requestId: payload.requestId,
+    retryAfterSeconds: payload.retryAfterSeconds,
+    providerMessage: truncateForLog(payload.providerMessage || payload.rawBody),
+    rawBody: truncateForLog(payload.rawBody),
+  });
+
+  return new ModelLimitError({
+    provider,
+    modelId,
+    stage,
+    httpStatus: res.status,
+    limitType,
+    providerCode: payload.providerCode,
+    providerMessage: payload.providerMessage,
+    requestId: payload.requestId,
+    retryAfterSeconds: payload.retryAfterSeconds,
+  });
+}
+
+function buildAnalysisScope(mediaSummary?: MediaSummary): AnalysisScope {
+  const imagesDetected = mediaSummary?.imageCount || 0;
+  const videosDetected = mediaSummary?.videoCount || 0;
+
+  return {
+    articleTextIncluded: true,
+    imagesDetected,
+    videosDetected,
+    imagesAnalyzed: false,
+    videosAnalyzed: false,
+    note:
+      imagesDetected > 0 || videosDetected > 0
+        ? `Detected ${imagesDetected} image${imagesDetected === 1 ? "" : "s"} and ${videosDetected} video${videosDetected === 1 ? "" : "s"} on the page, but the current analysis only sends extracted article text to the model.`
+        : "The current analysis only sends extracted article text to the model. No page images or videos are included yet.",
+  };
+}
+
+function diagnosticFromUnknownError(
+  model: ModelConfig,
+  error: unknown,
+): ModelAttemptDiagnostic {
+  return {
+    modelId: model.id,
+    provider: model.provider,
+    outcome: "error",
+    message:
+      error instanceof Error ? error.message : "Unknown model execution error",
+    attemptedAt: new Date().toISOString(),
+  };
 }
 
 function setCors(res: VercelResponse): void {
@@ -226,6 +527,7 @@ async function callGemini(
     jsonSchema,
     temperature = 0.15,
     maxOutputTokens = 1536,
+    stage,
   } = opts;
 
   const genConfig: Record<string, unknown> = {
@@ -272,11 +574,30 @@ async function callGemini(
     }
 
     if (res.status === 429) {
-      throw new QuotaExceededError("gemini");
+      const payload = await readProviderErrorPayload(res);
+      throw createModelLimitError({
+        provider: "gemini",
+        modelId: model.id,
+        stage,
+        res,
+        payload,
+      });
     }
 
-    const errBody = await res.text();
-    lastError = new Error(`Gemini API error (${res.status}): ${errBody}`);
+    const payload = await readProviderErrorPayload(res);
+    lastError = new Error(
+      `Gemini API error (${res.status}): ${payload.providerMessage || payload.rawBody}`,
+    );
+    console.error("[Verity][provider-error]", {
+      provider: "gemini",
+      modelId: model.id,
+      stage,
+      httpStatus: res.status,
+      providerCode: payload.providerCode,
+      requestId: payload.requestId,
+      providerMessage: truncateForLog(payload.providerMessage || payload.rawBody),
+      rawBody: truncateForLog(payload.rawBody),
+    });
 
     if (res.status >= 500 && attempt < MAX_RETRIES) {
       console.warn(`Gemini 5xx (${res.status}), retry ${attempt + 1}/${MAX_RETRIES}`);
@@ -295,7 +616,7 @@ async function callOpenAI(
   model: ModelConfig,
   opts: LlmCallOpts,
 ): Promise<LlmResponse> {
-  const { temperature = 0.15, maxOutputTokens = 1536 } = opts;
+  const { temperature = 0.15, maxOutputTokens = 1536, stage } = opts;
 
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -322,11 +643,30 @@ async function callOpenAI(
     }
 
     if (res.status === 429) {
-      throw new QuotaExceededError("openai");
+      const payload = await readProviderErrorPayload(res);
+      throw createModelLimitError({
+        provider: "openai",
+        modelId: model.id,
+        stage,
+        res,
+        payload,
+      });
     }
 
-    const errBody = await res.text();
-    lastError = new Error(`OpenAI API error (${res.status}): ${errBody}`);
+    const payload = await readProviderErrorPayload(res);
+    lastError = new Error(
+      `OpenAI API error (${res.status}): ${payload.providerMessage || payload.rawBody}`,
+    );
+    console.error("[Verity][provider-error]", {
+      provider: "openai",
+      modelId: model.id,
+      stage,
+      httpStatus: res.status,
+      providerCode: payload.providerCode,
+      requestId: payload.requestId,
+      providerMessage: truncateForLog(payload.providerMessage || payload.rawBody),
+      rawBody: truncateForLog(payload.rawBody),
+    });
 
     if (res.status >= 500 && attempt < MAX_RETRIES) {
       console.warn(`OpenAI 5xx (${res.status}), retry ${attempt + 1}/${MAX_RETRIES}`);
@@ -345,7 +685,7 @@ async function callOpenRouter(
   model: ModelConfig,
   opts: LlmCallOpts,
 ): Promise<LlmResponse> {
-  const { temperature = 0.15, maxOutputTokens = 1536 } = opts;
+  const { temperature = 0.15, maxOutputTokens = 1536, stage } = opts;
 
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -379,11 +719,30 @@ async function callOpenRouter(
     }
 
     if (res.status === 429) {
-      throw new QuotaExceededError("openrouter");
+      const payload = await readProviderErrorPayload(res);
+      throw createModelLimitError({
+        provider: "openrouter",
+        modelId: model.id,
+        stage,
+        res,
+        payload,
+      });
     }
 
-    const errBody = await res.text();
-    lastError = new Error(`OpenRouter API error (${res.status}): ${errBody}`);
+    const payload = await readProviderErrorPayload(res);
+    lastError = new Error(
+      `OpenRouter API error (${res.status}): ${payload.providerMessage || payload.rawBody}`,
+    );
+    console.error("[Verity][provider-error]", {
+      provider: "openrouter",
+      modelId: model.id,
+      stage,
+      httpStatus: res.status,
+      providerCode: payload.providerCode,
+      requestId: payload.requestId,
+      providerMessage: truncateForLog(payload.providerMessage || payload.rawBody),
+      rawBody: truncateForLog(payload.rawBody),
+    });
 
     if (res.status >= 500 && attempt < MAX_RETRIES) {
       console.warn(`OpenRouter 5xx (${res.status}), retry ${attempt + 1}/${MAX_RETRIES}`);
@@ -444,6 +803,7 @@ Article text: ${truncated}`;
     jsonSchema: DECOMPOSE_SCHEMA,
     maxOutputTokens: 700,
     temperature: 0.05,
+    stage: "claim_decomposition",
   });
 
   const trimmed = text.trim();
@@ -498,6 +858,7 @@ ${indexedClaims}`;
     useSearch: model.supportsWebSearch,
     temperature: 0.1,
     maxOutputTokens: 1700,
+    stage: "claim_evaluation",
   });
 
   const parsedText = extractJsonObject(text) || text;
@@ -622,6 +983,7 @@ Article text: ${truncated}`;
     jsonSchema: TONE_SCHEMA,
     temperature: 0.1,
     maxOutputTokens: 650,
+    stage: "tone_detection",
   });
 
   try {
@@ -697,9 +1059,14 @@ function buildSummary(
 
 async function analyzeWithModel(
   model: ModelConfig,
-  input: { url: string; title: string; body: string },
+  input: {
+    url: string;
+    title: string;
+    body: string;
+    mediaSummary?: MediaSummary;
+  },
 ) {
-  const { url, title, body } = input;
+  const { url, title, body, mediaSummary } = input;
   let claimTexts = await decomposeClaims(title, body, model);
 
   if (claimTexts.length === 0) {
@@ -750,7 +1117,9 @@ async function analyzeWithModel(
   try {
     toneAlerts = await detectTone(title, body, model);
   } catch (err) {
-    if (!(err instanceof QuotaExceededError)) {
+    if (err instanceof ModelLimitError) {
+      console.warn("[Verity][tone-skip-limit]", err.toDiagnostic());
+    } else {
       console.error("Tone detection failed (non-fatal):", err);
     }
   }
@@ -769,6 +1138,7 @@ async function analyzeWithModel(
     summary,
     analysisModel: model.id,
     analyzedAt: new Date().toISOString(),
+    analysisScope: buildAnalysisScope(mediaSummary),
   };
 }
 
@@ -797,7 +1167,8 @@ export default async function handler(
   }
 
   try {
-    const { url, title, body, analysisModel } = req.body as ArticleInput;
+    const { url, title, body, mediaSummary, analysisModel } =
+      req.body as ArticleInput;
 
     if (!title || !body) {
       return res
@@ -826,33 +1197,65 @@ export default async function handler(
         : [];
 
     const modelsToTry = [model, ...fallbackModels];
-    let lastQuotaError: QuotaExceededError | null = null;
+    const attempts: ModelAttemptDiagnostic[] = [];
+    let lastLimitError: ModelLimitError | null = null;
 
     for (const activeModel of modelsToTry) {
       try {
-        const result = await analyzeWithModel(activeModel, { url, title, body });
-        return res.status(200).json(result);
+        const result = await analyzeWithModel(activeModel, {
+          url,
+          title,
+          body,
+          mediaSummary,
+        });
+        attempts.push({
+          modelId: activeModel.id,
+          provider: activeModel.provider,
+          outcome: "success",
+          message: "Analysis completed successfully.",
+          attemptedAt: new Date().toISOString(),
+        });
+        return res.status(200).json({
+          ...result,
+          diagnostics: {
+            attempts,
+          } as AnalysisDiagnostics,
+        });
       } catch (err) {
-        if (err instanceof QuotaExceededError) {
-          lastQuotaError = err;
+        if (err instanceof ModelLimitError) {
+          attempts.push(err.toDiagnostic());
+          lastLimitError = err;
           continue;
         }
+        attempts.push(diagnosticFromUnknownError(activeModel, err));
         throw err;
       }
     }
 
-    if (lastQuotaError) {
-      throw lastQuotaError;
+    if (lastLimitError) {
+      throw Object.assign(lastLimitError, {
+        diagnostics: {
+          attempts,
+        } as AnalysisDiagnostics,
+      });
     }
 
     throw new Error("Analysis failed for all configured models");
   } catch (error) {
     console.error("Pipeline error:", error);
 
-    if (error instanceof QuotaExceededError) {
+    if (error instanceof ModelLimitError) {
+      const diagnostics =
+        typeof error === "object" &&
+        error &&
+        "diagnostics" in error &&
+        (error as { diagnostics?: AnalysisDiagnostics }).diagnostics
+          ? (error as { diagnostics: AnalysisDiagnostics }).diagnostics
+          : { attempts: [error.toDiagnostic()] };
       return res.status(429).json({
         error: error.message,
-        code: "QUOTA_EXCEEDED",
+        code: error.code,
+        details: diagnostics,
       });
     }
 

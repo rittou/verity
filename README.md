@@ -120,6 +120,14 @@ Request optimization:
 - Popup health check no longer consumes model requests.
 - Claims are capped to a smaller, high-impact set to reduce token and request usage.
 
+Provider diagnostics:
+- The proxy now logs provider limit responses with model id, stage, HTTP status, retry-after, request id, and the provider's own error text so you can tell confirmed quota exhaustion from plain rate limiting or an ambiguous `429`.
+- The popup mirrors those attempt diagnostics when an analysis is blocked.
+
+Current media support:
+- Page images and videos are detected for visibility, but the current analysis pipeline only sends extracted article text to the model.
+- No image bytes, video frames, or media transcripts are included in model input yet.
+
 ## Project Structure
 
 ```

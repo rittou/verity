@@ -24,6 +24,7 @@ export async function analyzeArticle(
       url: article.url,
       title: article.title,
       body: article.body,
+      mediaSummary: article.mediaSummary,
       analysisModel,
     }),
   });

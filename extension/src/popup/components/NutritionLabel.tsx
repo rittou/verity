@@ -21,6 +21,8 @@ export function NutritionLabel({
     (c) => c.status === "verified",
   ).length;
   const showComparison = modelComparisons.length > 1;
+  const priorLimitAttempts =
+    result.diagnostics?.attempts?.filter((attempt) => attempt.outcome === "limit") || [];
 
   return (
     <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
@@ -76,6 +78,38 @@ export function NutritionLabel({
           {result.summary}
         </p>
       </div>
+
+      {priorLimitAttempts.length > 0 && (
+        <div className="px-4 py-3 border-b border-zinc-800/60 bg-zinc-950/30">
+          <p className="text-[9px] uppercase tracking-[0.15em] text-zinc-500 font-bold mb-1.5">
+            Fallback Notes
+          </p>
+          <p className="text-[11px] text-zinc-400 leading-relaxed">
+            A previous model attempt was limited before this result completed:
+          </p>
+          <div className="mt-2 space-y-1.5">
+            {priorLimitAttempts.map((attempt) => (
+              <p
+                key={`${attempt.modelId}-${attempt.attemptedAt}`}
+                className="text-[11px] text-zinc-500 leading-relaxed"
+              >
+                {attempt.modelId}: {attempt.message}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {result.analysisScope && (
+        <div className="px-4 py-3 border-b border-zinc-800/60 bg-zinc-950/20">
+          <p className="text-[9px] uppercase tracking-[0.15em] text-zinc-500 font-bold mb-1.5">
+            Analysis Scope
+          </p>
+          <p className="text-[11px] text-zinc-400 leading-relaxed">
+            {result.analysisScope.note}
+          </p>
+        </div>
+      )}
 
       {showComparison && (
         <div className="px-4 py-3 border-b border-zinc-800/60">

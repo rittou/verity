@@ -1,5 +1,6 @@
 import type {
   ArticleData,
+  AnalysisDiagnostics,
   AnalysisResult,
   ModelScoreComparisonEntry,
 } from "../lib/types";
@@ -188,6 +189,7 @@ async function analyzeArticle(
       url: article.url,
       title: article.title,
       body: article.body,
+      mediaSummary: article.mediaSummary,
       analysisModel,
     }),
   });
@@ -202,7 +204,11 @@ async function analyzeArticle(
     }
     const code = errBody.code || "";
     const msg = errBody.error || `Proxy error ${response.status}`;
-    throw Object.assign(new Error(msg), { code });
+    const details =
+      typeof errBody === "object" && errBody && "details" in errBody
+        ? (errBody as { details?: unknown }).details
+        : undefined;
+    throw Object.assign(new Error(msg), { code, details });
   }
 
   const result: AnalysisResult = await response.json();
@@ -254,11 +260,12 @@ chrome.runtime.onMessage.addListener(
         .then((result) =>
           sendResponse({ type: "ANALYSIS_RESULT", data: result }),
         )
-        .catch((err: Error & { code?: string }) =>
+        .catch((err: Error & { code?: string; details?: AnalysisDiagnostics }) =>
           sendResponse({
             type: "ANALYSIS_ERROR",
             error: err.message,
             code: err.code || "",
+            details: err.details || null,
           }),
         );
       return true;

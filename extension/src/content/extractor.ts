@@ -33,7 +33,7 @@ const CONTENT_SELECTORS = [
 const NOISE_SELECTORS =
   'script, style, nav, aside, footer, header, .ad, .advertisement, .social-share, .related-articles, .comments, [aria-hidden="true"], figcaption, .newsletter-signup';
 
-function getBodyText(): string {
+function findArticleContainer(): Element | null {
   let container: Element | null = null;
 
   for (const selector of CONTENT_SELECTORS) {
@@ -54,21 +54,60 @@ function getBodyText(): string {
     }
   }
 
-  if (!container) return "";
+  return container;
+}
+
+function buildCleanClone(container: Element | null): Element | null {
+  if (!container) return null;
 
   const clone = container.cloneNode(true) as Element;
   clone.querySelectorAll(NOISE_SELECTORS).forEach((el) => el.remove());
+  return clone;
+}
+
+function getBodyText(container: Element | null): string {
+  const clone = buildCleanClone(container);
+  if (!clone) return "";
 
   const text = clone.textContent?.replace(/\s+/g, " ").trim() || "";
   return text.slice(0, 8000);
 }
 
+function isEmbeddedVideoFrame(src: string | null): boolean {
+  if (!src) return false;
+  return /youtube|youtu\.be|vimeo|dailymotion|wistia|jwplayer|tiktok/i.test(src);
+}
+
+function getMediaSummary(container: Element | null) {
+  const clone = buildCleanClone(container);
+  if (!clone) {
+    return {
+      imageCount: 0,
+      videoCount: 0,
+    };
+  }
+
+  const imageCount = clone.querySelectorAll("img, picture img").length;
+  const embeddedVideoCount = Array.from(clone.querySelectorAll("iframe")).filter(
+    (frame) => isEmbeddedVideoFrame(frame.getAttribute("src")),
+  ).length;
+  const videoCount = clone.querySelectorAll("video").length + embeddedVideoCount;
+
+  return {
+    imageCount,
+    videoCount,
+  };
+}
+
 export function extractArticle(): ArticleData {
+  const container = findArticleContainer();
+
   return {
     url: window.location.href,
     title: getTitle(),
-    body: getBodyText(),
+    body: getBodyText(container),
     siteName: getMetaContent("og:site_name"),
     publishedDate: getMetaContent("article:published_time"),
+    mediaSummary: getMediaSummary(container),
   };
 }
