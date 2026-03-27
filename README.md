@@ -32,7 +32,7 @@ A Chrome Extension (Manifest V3) that identifies misinformation in news articles
 ## The SAFE Pipeline
 
 1. **Claim Decomposition** — LLM extracts individual verifiable claims from the article
-2. **Search-Grounded Verification** — Each claim is evaluated by Gemini with Google Search grounding enabled (`"tools": [{"google_search": {}}]`), so the model searches the live web for authoritative sources and existing debunks before rendering a verdict
+2. **Verification** — Claims are evaluated in a single batched LLM call (instead of one call per claim) to drastically reduce request count and token usage
 3. **Fallacy Detection** — The same grounded call checks for logical fallacies (ad hominem, straw man, false dichotomy, hasty generalization, etc.)
 4. **Bias & Tone Detection** — Automated scan for emotional manipulation, gender/racial bias, and loaded language
 5. **Scoring** — Aggregated trust score (0–100) with letter grade (A–F)
@@ -40,7 +40,9 @@ A Chrome Extension (Manifest V3) that identifies misinformation in news articles
 ## Prerequisites
 
 - Node.js 18+
-- A [Gemini API key](https://aistudio.google.com/apikey) (free tier: 250 req/day)
+- A [Gemini API key](https://aistudio.google.com/apikey) (recommended for search-grounded mode)
+- Optional: an OpenAI API key for alternative model selection
+- Optional: an [OpenRouter API key](https://openrouter.ai) for free-model routing (`openrouter/free`, `:free` variants)
 - A [Vercel](https://vercel.com) Hobby account (free)
 
 ## Setup
@@ -60,8 +62,10 @@ To deploy:
 vercel --prod
 ```
 
-Then set the environment variable in the Vercel dashboard:
-- `GEMINI_API_KEY`
+Then set environment variable(s) in the Vercel dashboard:
+- `GEMINI_API_KEY` (for Gemini models)
+- `OPENAI_API_KEY` (optional, for OpenAI model)
+- `OPENROUTER_API_KEY` (optional, for OpenRouter free models)
 
 ### 2. Extension
 
@@ -99,7 +103,9 @@ After rebuilding, click the refresh icon on `chrome://extensions` to reload.
 
 | Variable | Location | Description |
 |---|---|---|
-| `GEMINI_API_KEY` | `proxy/.env` | Gemini 2.5 Flash API key (only key needed) |
+| `GEMINI_API_KEY` | `proxy/.env` | Enables `gemini-grounded` and `gemini-fast` |
+| `OPENAI_API_KEY` | `proxy/.env` | Enables `openai-gpt-4.1-mini` |
+| `OPENROUTER_API_KEY` | `proxy/.env` | Enables `openrouter-free-router` and free variant models |
 | `VITE_PROXY_URL` | `extension/.env` | URL of the deployed proxy |
 
 ## Zero-Budget Strategy
@@ -109,7 +115,10 @@ After rebuilding, click the refresh icon on `chrome://extensions` to reload.
 | Gemini 2.5 Flash | 250 requests/day (includes search grounding) |
 | Vercel Hobby | 100 GB-hours/month |
 
-Token optimization: All LLM prompts request plain-text responses (not JSON) to reduce output token count by ~50%.
+Request optimization:
+- Pipeline now uses 2 core LLM calls per analysis (claim decomposition + batched verification) plus optional tone pass, replacing many per-claim calls.
+- Popup health check no longer consumes model requests.
+- Claims are capped to a smaller, high-impact set to reduce token and request usage.
 
 ## Project Structure
 

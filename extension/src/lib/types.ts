@@ -40,14 +40,38 @@ export interface AnalysisResult {
   toneAlerts: ToneAlert[];
   summary: string;
   analyzedAt: string;
+  analysisModel?: string;
+}
+
+export interface ModelScoreComparisonEntry {
+  modelId: string;
+  analysisModel: string;
+  trustScore: number;
+  grade: "A" | "B" | "C" | "D" | "F";
+  analyzedAt: string;
+}
+
+export interface AnalysisModelOption {
+  id: string;
+  label: string;
+  description: string;
+  available: boolean;
 }
 
 export type ExtensionMessage =
   | { type: "GET_ARTICLE_DATA" }
   | { type: "ARTICLE_DATA"; data: ArticleData }
-  | { type: "ANALYZE_ARTICLE"; data: ArticleData }
+  | { type: "ANALYZE_ARTICLE"; data: ArticleData; analysisModel?: string }
+  | {
+      type: "GET_ANALYSIS_STATUS";
+      url?: string;
+      data?: ArticleData;
+      analysisModel?: string;
+    }
   | { type: "ANALYSIS_RESULT"; data: AnalysisResult }
   | { type: "ANALYSIS_ERROR"; error: string }
   | { type: "SHOW_OVERLAY"; data: AnalysisResult }
   | { type: "REMOVE_OVERLAY" }
-  | { type: "GET_PROXY_URL" };
+  | { type: "GET_MODEL_SCORE_COMPARISON"; data: ArticleData }
+  | { type: "GET_PROXY_URL" }
+  | { type: "GET_MODEL_OPTIONS" };

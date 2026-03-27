@@ -43,29 +43,57 @@ const steps: Step[] = [
 ];
 
 const TOTAL_ESTIMATED = steps.reduce((s, step) => s + step.duration, 0);
+const BASE_MAX_VISIBLE_PROGRESS = 97;
+const MAX_PROGRESS_OVER_TIME = 99;
 
-export function AnalysisProgress() {
-  const [currentStep, setCurrentStep] = useState(0);
+interface AnalysisProgressProps {
+  startedAt?: number;
+}
+
+export function AnalysisProgress({ startedAt }: AnalysisProgressProps) {
+  const startTime = useRef(startedAt || Date.now());
+  const initialElapsed = useRef(Date.now() - startTime.current);
+
+  const computeInitialStep = () => {
+    const ms = initialElapsed.current;
+    let cumulative = 0;
+    for (let i = 0; i < steps.length; i++) {
+      cumulative += steps[i].duration;
+      if (ms < cumulative) return i;
+    }
+    return steps.length - 1;
+  };
+
+  const [currentStep, setCurrentStep] = useState(computeInitialStep);
   const [stepProgress, setStepProgress] = useState(0);
-  const [elapsed, setElapsed] = useState(0);
-  const startTime = useRef(Date.now());
+  const [elapsed, setElapsed] = useState(
+    Math.floor(initialElapsed.current / 1000),
+  );
 
-  // Advance steps on timers
   useEffect(() => {
+    const ms = initialElapsed.current;
     const timers: ReturnType<typeof setTimeout>[] = [];
     let cumulative = 0;
     for (let i = 1; i < steps.length; i++) {
       cumulative += steps[i - 1].duration;
-      const step = i;
-      timers.push(setTimeout(() => setCurrentStep(step), cumulative));
+      const remaining = cumulative - ms;
+      if (remaining > 0) {
+        const step = i;
+        timers.push(setTimeout(() => setCurrentStep(step), remaining));
+      }
     }
     return () => timers.forEach(clearTimeout);
   }, []);
 
-  // Per-step progress bar (0 → 100 over the step's duration)
   useEffect(() => {
-    setStepProgress(0);
+    const ms = initialElapsed.current;
+    let cumulativeBefore = 0;
+    for (let i = 0; i < currentStep; i++) cumulativeBefore += steps[i].duration;
+    const elapsedInStep = Math.max(0, ms - cumulativeBefore);
     const dur = steps[currentStep].duration;
+    const startPct = Math.min(100, (elapsedInStep / dur) * 100);
+
+    setStepProgress(startPct);
     const interval = 50;
     const increment = (100 / dur) * interval;
     const id = setInterval(() => {
@@ -74,7 +102,6 @@ export function AnalysisProgress() {
     return () => clearInterval(id);
   }, [currentStep]);
 
-  // Elapsed time counter
   useEffect(() => {
     const id = setInterval(() => {
       setElapsed(Math.floor((Date.now() - startTime.current) / 1000));
@@ -82,12 +109,23 @@ export function AnalysisProgress() {
     return () => clearInterval(id);
   }, []);
 
+  const overtimeSeconds = Math.max(
+    0,
+    elapsed - Math.round(TOTAL_ESTIMATED / 1000),
+  );
+  const dynamicMaxProgress = Math.min(
+    MAX_PROGRESS_OVER_TIME,
+    BASE_MAX_VISIBLE_PROGRESS + Math.floor(overtimeSeconds / 5),
+  );
+
   const overallProgress = Math.min(
-    100,
+    dynamicMaxProgress,
     ((currentStep / steps.length) * 100 +
       (stepProgress / steps.length)) |
       0,
   );
+
+  const takingLongerThanExpected = elapsed > Math.round(TOTAL_ESTIMATED / 1000);
 
   return (
     <div className="flex-1 flex flex-col items-center gap-6 py-5">
@@ -222,7 +260,9 @@ export function AnalysisProgress() {
         </span>
         <span className="w-px h-3 bg-zinc-800" />
         <span>
-          ~{Math.max(0, Math.round((TOTAL_ESTIMATED / 1000) - elapsed))}s remaining
+          {takingLongerThanExpected
+            ? "Still waiting for AI reasoning/report completion"
+            : `~${Math.max(0, Math.round((TOTAL_ESTIMATED / 1000) - elapsed))}s remaining`}
         </span>
       </div>
     </div>
