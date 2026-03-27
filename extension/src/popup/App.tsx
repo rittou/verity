@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type {
   AnalysisDiagnostics,
   AnalysisModelOption,
@@ -20,6 +20,7 @@ type AppState =
   | "no-article";
 
 export default function App() {
+  const requestTokenRef = useRef(0);
   const [state, setState] = useState<AppState>("extracting");
   const [article, setArticle] = useState<ArticleData | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
@@ -31,10 +32,6 @@ export default function App() {
   >([]);
   const [analysisStartedAt, setAnalysisStartedAt] = useState<number | undefined>();
   const [limitDetails, setLimitDetails] = useState<AnalysisDiagnostics | null>(null);
-  const [previousScore, setPreviousScore] = useState<ModelScoreComparisonEntry | null>(null);
-  const [previousCachedResult, setPreviousCachedResult] = useState<AnalysisResult | null>(
-    null,
-  );
 
   const fetchModelComparisons = async (
     articleData: ArticleData | null,
@@ -63,6 +60,29 @@ export default function App() {
     return comparisons;
   };
 
+  const loadCachedForModel = async (
+    articleData: ArticleData | null,
+    modelId: string,
+  ) => {
+    if (!articleData) {
+      return null;
+    }
+
+    const status = await chrome.runtime
+      .sendMessage({
+        type: "GET_ANALYSIS_STATUS",
+        data: articleData,
+        analysisModel: modelId,
+      })
+      .catch(() => ({ inProgress: false }));
+
+    const cachedResult = status?.cached
+      ? (status.cached as AnalysisResult)
+      : null;
+
+    return { status, cachedResult };
+  };
+
   const handleAnalysisResponse = async (
     response: {
       type?: string;
@@ -78,13 +98,17 @@ export default function App() {
         response.code === "MODEL_LIMIT_REACHED" ||
         response.code === "QUOTA_EXCEEDED"
       ) {
-        setError(response.error || "The model provider limited this request.");
+        setError(
+          conciseErrorMessage(
+            response.error || "The model provider limited this request.",
+          ),
+        );
         setLimitDetails(response.details || null);
         console.warn("[Verity] Model limit details", response.details || {});
         setState("limit");
         return;
       }
-      throw new Error(response.error || "Analysis failed");
+      throw new Error(conciseErrorMessage(response.error || "Analysis failed"));
     }
 
     if (!response?.data) {
@@ -93,14 +117,6 @@ export default function App() {
 
     setResult(response.data);
     setLimitDetails(null);
-    setPreviousCachedResult(response.data);
-    setPreviousScore({
-      modelId: response.data.analysisModel || selectedModel,
-      analysisModel: response.data.analysisModel || selectedModel,
-      trustScore: response.data.trustScore,
-      grade: response.data.grade,
-      analyzedAt: response.data.analyzedAt,
-    });
     setState("done");
     await loadModelComparisons(articleForComparison);
 
@@ -177,25 +193,10 @@ export default function App() {
 
       if (extractedArticle) {
         setArticle(extractedArticle);
-        const comparisons = await loadModelComparisons(extractedArticle);
-        const latestComparison =
-          comparisons.length > 0
-            ? [...comparisons].sort(
-                (a, b) =>
-                  new Date(b.analyzedAt).getTime() -
-                  new Date(a.analyzedAt).getTime(),
-              )[0]
-            : null;
-        setPreviousScore(latestComparison);
-        setPreviousCachedResult(null);
+        await loadModelComparisons(extractedArticle);
 
-        const status = await chrome.runtime
-          .sendMessage({
-            type: "GET_ANALYSIS_STATUS",
-            data: extractedArticle,
-            analysisModel: initialModel,
-          })
-          .catch(() => ({ inProgress: false }));
+        const modelCache = await loadCachedForModel(extractedArticle, initialModel);
+        const status = modelCache?.status || { inProgress: false };
 
         if (status?.inProgress) {
           setAnalysisStartedAt(status.startedAt || Date.now());
@@ -210,18 +211,6 @@ export default function App() {
           return;
         }
 
-        if (status?.cached) {
-          const cachedResult = status.cached as AnalysisResult;
-          setPreviousCachedResult(cachedResult);
-          setPreviousScore({
-            modelId: cachedResult.analysisModel || initialModel,
-            analysisModel: cachedResult.analysisModel || initialModel,
-            trustScore: cachedResult.trustScore,
-            grade: cachedResult.grade,
-            analyzedAt: cachedResult.analyzedAt,
-          });
-        }
-
         setState("idle");
       } else {
         setState("no-article");
@@ -231,8 +220,17 @@ export default function App() {
     init();
   }, []);
 
+  useEffect(() => {
+    if (!article || !selectedModel) return;
+    if (state === "analyzing") return;
+
+    loadModelComparisons(article).catch(() => {});
+  }, [article, selectedModel, state]);
+
   const analyze = async (forceRefresh = false) => {
     if (!article) return;
+    const requestToken = Date.now();
+    requestTokenRef.current = requestToken;
     setAnalysisStartedAt(Date.now());
     setState("analyzing");
     setResult(null);
@@ -247,11 +245,47 @@ export default function App() {
         forceRefresh,
         analysisModel: selectedModel,
       });
+      if (requestTokenRef.current !== requestToken) return;
       await handleAnalysisResponse(response || {}, article);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Analysis failed");
+      if (requestTokenRef.current !== requestToken) return;
+      setError(
+        conciseErrorMessage(err instanceof Error ? err.message : "Analysis failed"),
+      );
       setState("error");
     }
+  };
+
+  const cancelAnalysis = () => {
+    requestTokenRef.current += 1;
+    setAnalysisStartedAt(undefined);
+    setLimitDetails(null);
+    setError("");
+    setState(article ? "idle" : "no-article");
+  };
+
+  const backToDetectedArticle = () => {
+    setError("");
+    setLimitDetails(null);
+    setResult(null);
+    setState(article ? "idle" : "no-article");
+  };
+
+  const conciseErrorMessage = (input: string): string => {
+    let text = input.replace(/\s+/g, " ").trim();
+    const providerSaidIndex = text.toLowerCase().indexOf(" provider said:");
+    if (providerSaidIndex > 0) {
+      text = text.slice(0, providerSaidIndex).trim();
+    }
+    const forMoreIndex = text.toLowerCase().indexOf(" for more information");
+    if (forMoreIndex > 0) {
+      text = text.slice(0, forMoreIndex).trim();
+    }
+    const urlIndex = text.search(/https?:\/\//i);
+    if (urlIndex > 0) {
+      text = text.slice(0, urlIndex).trim();
+    }
+    return text.length > 180 ? `${text.slice(0, 177).trimEnd()}...` : text;
   };
 
   const unavailableSelected =
@@ -397,39 +431,64 @@ export default function App() {
             >
               Analyze for Misinformation
             </button>
-            {previousScore && (
+            {modelComparisonRows.length > 0 && (
               <div className="p-3 bg-zinc-900/70 rounded-xl border border-zinc-800/70">
                 <p className="text-[10px] uppercase tracking-widest text-zinc-600 font-semibold">
-                  Previous Score
+                  Previous Scores
                 </p>
-                <div className="flex items-baseline justify-between gap-3 mt-2">
-                  <p className="text-sm font-semibold text-zinc-200">
-                    {previousScore.trustScore}/100 ({previousScore.grade})
-                  </p>
-                  <p className="text-[11px] text-zinc-500">
-                    {labelForModel(previousScore.analysisModel || previousScore.modelId)}
-                  </p>
+                <div className="mt-2 space-y-2">
+                  {modelComparisonRows.map((scoreRow) => (
+                    <div
+                      key={`${scoreRow.analysisModel || scoreRow.modelId}-${scoreRow.analyzedAt}`}
+                      className="rounded-lg border border-zinc-800/80 bg-zinc-950/70 px-2.5 py-2"
+                    >
+                      <div className="flex items-baseline justify-between gap-3">
+                        <p className="text-sm font-semibold text-zinc-200">
+                          {scoreRow.trustScore}/100 ({scoreRow.grade})
+                        </p>
+                        <p className="text-[11px] text-zinc-500">
+                          {scoreRow.modelLabel}
+                        </p>
+                      </div>
+                      <p className="text-[11px] text-zinc-500 mt-1.5">
+                        {new Date(scoreRow.analyzedAt).toLocaleString()}
+                      </p>
+                      <button
+                        onClick={async () => {
+                          const modelId =
+                            scoreRow.analysisModel || scoreRow.modelId;
+                          const previousCache = await loadCachedForModel(
+                            article,
+                            modelId,
+                          );
+                          if (previousCache?.cachedResult) {
+                            setResult(previousCache.cachedResult);
+                            setState("done");
+                          }
+                        }}
+                        className="mt-2 text-[11px] text-emerald-400 hover:text-emerald-300 transition-colors"
+                      >
+                        View report
+                      </button>
+                    </div>
+                  ))}
                 </div>
-                <p className="text-[11px] text-zinc-500 mt-1.5">
-                  {new Date(previousScore.analyzedAt).toLocaleString()}
-                </p>
-                {previousCachedResult && (
-                  <button
-                    onClick={() => {
-                      setResult(previousCachedResult);
-                      setState("done");
-                    }}
-                    className="mt-2 text-[11px] text-emerald-400 hover:text-emerald-300 transition-colors"
-                  >
-                    View previous report
-                  </button>
-                )}
               </div>
             )}
           </div>
         )}
 
-        {state === "analyzing" && <AnalysisProgress startedAt={analysisStartedAt} />}
+        {state === "analyzing" && (
+          <div className="flex-1 flex flex-col items-center justify-center gap-4">
+            <AnalysisProgress startedAt={analysisStartedAt} />
+            <button
+              onClick={cancelAnalysis}
+              className="py-2 px-4 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+            >
+              Cancel Analysis
+            </button>
+          </div>
+        )}
 
         {state === "done" && result && (
           <div className="flex flex-col gap-3 overflow-y-auto -mx-1 px-1">
@@ -504,6 +563,12 @@ export default function App() {
             >
               Try with Selected Model
             </button>
+            <button
+              onClick={backToDetectedArticle}
+              className="py-2 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+            >
+              Back to Detected Article
+            </button>
           </div>
         )}
 
@@ -520,6 +585,12 @@ export default function App() {
               className="py-2.5 px-5 text-sm text-zinc-300 bg-zinc-800 rounded-xl hover:bg-zinc-700 transition-colors font-medium"
             >
               Retry
+            </button>
+            <button
+              onClick={backToDetectedArticle}
+              className="py-2 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+            >
+              Back to Detected Article
             </button>
           </div>
         )}

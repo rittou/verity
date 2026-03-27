@@ -273,20 +273,18 @@ function providerLabel(provider: ModelProvider): string {
 function buildLimitMessage(
   provider: ModelProvider,
   limitType: ModelLimitType,
-  providerMessage?: string,
 ): string {
   const label = providerLabel(provider);
-  const suffix = providerMessage ? ` Provider said: ${providerMessage}` : "";
 
   if (limitType === "quota_confirmed") {
-    return `${label} confirmed that this request is out of quota.${suffix}`;
+    return `${label} confirmed that this request is out of quota.`;
   }
 
   if (limitType === "rate_limited") {
-    return `${label} rate-limited this request.${suffix}`;
+    return `${label} rate-limited this request.`;
   }
 
-  return `${label} returned HTTP 429, but it did not clearly confirm quota exhaustion versus a temporary rate limit.${suffix}`;
+  return `${label} returned HTTP 429, but did not clearly confirm whether this is quota exhaustion or temporary rate limiting.`;
 }
 
 function truncateForLog(input: string, maxLen = 500): string {
@@ -461,20 +459,6 @@ function buildAnalysisScope(mediaSummary?: MediaSummary): AnalysisScope {
       imagesDetected > 0 || videosDetected > 0
         ? `Detected ${imagesDetected} image${imagesDetected === 1 ? "" : "s"} and ${videosDetected} video${videosDetected === 1 ? "" : "s"} on the page, but the current analysis only sends extracted article text to the model.`
         : "The current analysis only sends extracted article text to the model. No page images or videos are included yet.",
-  };
-}
-
-function diagnosticFromUnknownError(
-  model: ModelConfig,
-  error: unknown,
-): ModelAttemptDiagnostic {
-  return {
-    modelId: model.id,
-    provider: model.provider,
-    outcome: "error",
-    message:
-      error instanceof Error ? error.message : "Unknown model execution error",
-    attemptedAt: new Date().toISOString(),
   };
 }
 
@@ -1052,6 +1036,10 @@ function buildSummary(
   claims: Claim[],
   toneAlerts: ToneAlert[],
 ): string {
+  if (claims.length === 0) {
+    return `Trust score ${trustScore}/100 (Grade ${grade}). No atomic verifiable claims were extracted from the article text, and ${toneAlerts.length} tone alerts were detected.`;
+  }
+
   const disputed = claims.filter((c) => c.status === "disputed").length;
   const verified = claims.filter((c) => c.status === "verified").length;
   return `Trust score ${trustScore}/100 (Grade ${grade}) with ${disputed} disputed claims, ${verified} verified claims, and ${toneAlerts.length} tone alerts.`;
@@ -1075,9 +1063,7 @@ async function analyzeWithModel(
   }
 
   if (claimTexts.length === 0) {
-    throw new Error(
-      "Could not extract verifiable claims from this article. The article may be too short, opinion-based, or the AI model returned an empty response.",
-    );
+    console.warn("No verifiable claims extracted after retry; continuing with tone-only analysis.");
   }
 
   const evaluatedClaims = await evaluateClaims(claimTexts, model);
@@ -1190,57 +1176,37 @@ export default async function handler(
       });
     }
 
-    const fallbackModels =
-      model.id !== "openrouter-free-router" &&
-      isModelConfigured(getModelById("openrouter-free-router"))
-        ? [getModelById("openrouter-free-router")]
-        : [];
-
-    const modelsToTry = [model, ...fallbackModels];
-    const attempts: ModelAttemptDiagnostic[] = [];
-    let lastLimitError: ModelLimitError | null = null;
-
-    for (const activeModel of modelsToTry) {
-      try {
-        const result = await analyzeWithModel(activeModel, {
-          url,
-          title,
-          body,
-          mediaSummary,
-        });
-        attempts.push({
-          modelId: activeModel.id,
-          provider: activeModel.provider,
-          outcome: "success",
-          message: "Analysis completed successfully.",
-          attemptedAt: new Date().toISOString(),
-        });
-        return res.status(200).json({
-          ...result,
-          diagnostics: {
-            attempts,
-          } as AnalysisDiagnostics,
-        });
-      } catch (err) {
-        if (err instanceof ModelLimitError) {
-          attempts.push(err.toDiagnostic());
-          lastLimitError = err;
-          continue;
-        }
-        attempts.push(diagnosticFromUnknownError(activeModel, err));
-        throw err;
-      }
-    }
-
-    if (lastLimitError) {
-      throw Object.assign(lastLimitError, {
+    try {
+      const result = await analyzeWithModel(model, {
+        url,
+        title,
+        body,
+        mediaSummary,
+      });
+      return res.status(200).json({
+        ...result,
         diagnostics: {
-          attempts,
+          attempts: [
+            {
+              modelId: model.id,
+              provider: model.provider,
+              outcome: "success",
+              message: "Analysis completed successfully.",
+              attemptedAt: new Date().toISOString(),
+            },
+          ],
         } as AnalysisDiagnostics,
       });
+    } catch (err) {
+      if (err instanceof ModelLimitError) {
+        throw Object.assign(err, {
+          diagnostics: {
+            attempts: [err.toDiagnostic()],
+          } as AnalysisDiagnostics,
+        });
+      }
+      throw err;
     }
-
-    throw new Error("Analysis failed for all configured models");
   } catch (error) {
     console.error("Pipeline error:", error);
 

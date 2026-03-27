@@ -14,7 +14,6 @@ const inFlightStartTimes = new Map<string, number>();
 
 interface CachedAnalysisEntry {
   result: AnalysisResult;
-  fingerprint: string;
 }
 
 type StoredAnalysis = CachedAnalysisEntry | AnalysisResult;
@@ -27,44 +26,22 @@ function inFlightKey(url: string, analysisModel: string): string {
   return `${analysisModel}::${url}`;
 }
 
-function hashString(input: string): string {
-  let hash = 2166136261;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i);
-    hash +=
-      (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
-  }
-  return (hash >>> 0).toString(16);
-}
-
-function articleFingerprint(article: Pick<ArticleData, "title" | "body">): string {
-  const compactBody = article.body.slice(0, 2000);
-  return hashString(`${article.title}::${article.body.length}::${compactBody}`);
-}
-
 async function getCachedResult(
   url: string,
   analysisModel: string,
-  expectedFingerprint: string,
 ): Promise<AnalysisResult | null> {
   const key = cacheKey(url, analysisModel);
   const data = await chrome.storage.local.get(key);
   const stored = data[key] as CachedAnalysisEntry | AnalysisResult | undefined;
   if (!stored) return null;
 
-  let cached: AnalysisResult | null = null;
-  let fingerprint: string | null = null;
-
-  if ("result" in stored && stored.result && "fingerprint" in stored) {
-    cached = stored.result;
-    fingerprint = stored.fingerprint;
-  } else {
-    cached = stored as AnalysisResult;
-  }
+  const cached =
+    "result" in stored && stored.result
+      ? stored.result
+      : (stored as AnalysisResult);
 
   if (!cached) return null;
-  if (fingerprint && fingerprint !== expectedFingerprint) return null;
-  if (!fingerprint) return null;
+  if (cached.url !== url) return null;
 
   const age = Date.now() - new Date(cached.analyzedAt).getTime();
   if (age > CACHE_TTL_MS) {
@@ -78,10 +55,9 @@ async function setCachedResult(
   url: string,
   result: AnalysisResult,
   analysisModel: string,
-  fingerprint: string,
 ): Promise<void> {
   const key = cacheKey(url, analysisModel);
-  const entry: CachedAnalysisEntry = { result, fingerprint };
+  const entry: CachedAnalysisEntry = { result };
   await chrome.storage.local.set({ [key]: entry });
 }
 
@@ -123,7 +99,6 @@ async function clearCachedResult(
 async function getModelScoreComparison(
   article: Pick<ArticleData, "url" | "title" | "body">,
 ): Promise<ModelScoreComparisonEntry[]> {
-  const expectedFingerprint = articleFingerprint(article);
   const suffix = `_${article.url}`;
   const all = await chrome.storage.local.get(null);
   const rows: ModelScoreComparisonEntry[] = [];
@@ -136,18 +111,12 @@ async function getModelScoreComparison(
     const stored = value as StoredAnalysis | undefined;
     if (!stored) continue;
 
-    let cached: AnalysisResult | null = null;
-    let fingerprint: string | null = null;
-
-    if ("result" in stored && stored.result && "fingerprint" in stored) {
-      cached = stored.result;
-      fingerprint = stored.fingerprint;
-    } else {
-      cached = stored as AnalysisResult;
-    }
+    const cached =
+      "result" in stored && stored.result
+        ? stored.result
+        : (stored as AnalysisResult);
 
     if (!cached) continue;
-    if (!fingerprint || fingerprint !== expectedFingerprint) continue;
     if (cached.url !== article.url) continue;
 
     const age = Date.now() - new Date(cached.analyzedAt).getTime();
@@ -170,15 +139,10 @@ async function analyzeArticle(
   forceRefresh = false,
   analysisModel = "gemini-grounded",
 ): Promise<AnalysisResult> {
-  const fingerprint = articleFingerprint(article);
   if (forceRefresh) {
     await clearCachedResult(article.url, analysisModel);
   } else {
-    const cached = await getCachedResult(
-      article.url,
-      analysisModel,
-      fingerprint,
-    );
+    const cached = await getCachedResult(article.url, analysisModel);
     if (cached) return cached;
   }
 
@@ -213,9 +177,7 @@ async function analyzeArticle(
 
   const result: AnalysisResult = await response.json();
 
-  if (result.claims && result.claims.length > 0) {
-    await setCachedResult(article.url, result, analysisModel, fingerprint);
-  }
+  await setCachedResult(article.url, result, analysisModel);
 
   const [tab] = await chrome.tabs.query({
     active: true,
@@ -275,9 +237,6 @@ chrome.runtime.onMessage.addListener(
       const analysisModel = message.analysisModel || "gemini-grounded";
       const statusUrl = message.data?.url || message.url!;
       const key = inFlightKey(statusUrl, analysisModel);
-      const fingerprint = message.data
-        ? articleFingerprint(message.data)
-        : "";
       const inProgress = inFlightAnalyses.has(key);
 
       if (inProgress) {
@@ -289,7 +248,7 @@ chrome.runtime.onMessage.addListener(
         return true;
       }
 
-      getCachedResult(statusUrl, analysisModel, fingerprint)
+      getCachedResult(statusUrl, analysisModel)
         .then((cached) =>
           sendResponse({
             inProgress,
