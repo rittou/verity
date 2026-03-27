@@ -104,6 +104,7 @@ export type ExtensionMessage =
   | { type: "GET_ARTICLE_DATA" }
   | { type: "ARTICLE_DATA"; data: ArticleData }
   | { type: "ANALYZE_ARTICLE"; data: ArticleData; analysisModel?: string }
+  | { type: "CANCEL_ANALYSIS"; url: string; analysisModel?: string }
   | {
       type: "GET_ANALYSIS_STATUS";
       url?: string;

@@ -128,7 +128,7 @@ export function AnalysisProgress({ startedAt }: AnalysisProgressProps) {
   const takingLongerThanExpected = elapsed > Math.round(TOTAL_ESTIMATED / 1000);
 
   return (
-    <div className="flex-1 flex flex-col items-center gap-6 py-5">
+    <div className="flex-1 w-full flex flex-col items-center gap-6 py-5">
       {/* Spinner + score circle */}
       <div className="relative w-[72px] h-[72px]">
         <svg className="w-full h-full -rotate-90" viewBox="0 0 72 72">
@@ -162,7 +162,7 @@ export function AnalysisProgress({ startedAt }: AnalysisProgressProps) {
       </div>
 
       {/* Step list */}
-      <div className="flex flex-col gap-1 w-full">
+      <div className="flex w-full flex-col gap-1">
         {steps.map((step, i) => {
           const Icon = step.icon;
           const isActive = i === currentStep;

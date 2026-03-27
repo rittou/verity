@@ -21,6 +21,7 @@ type AppState =
 
 export default function App() {
   const requestTokenRef = useRef(0);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const [state, setState] = useState<AppState>("extracting");
   const [article, setArticle] = useState<ArticleData | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
@@ -227,6 +228,11 @@ export default function App() {
     loadModelComparisons(article).catch(() => {});
   }, [article, selectedModel, state]);
 
+  useEffect(() => {
+    if (state !== "error" && state !== "limit") return;
+    contentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [state]);
+
   const analyze = async (forceRefresh = false) => {
     if (!article) return;
     const requestToken = Date.now();
@@ -258,6 +264,15 @@ export default function App() {
 
   const cancelAnalysis = () => {
     requestTokenRef.current += 1;
+    if (article) {
+      chrome.runtime
+        .sendMessage({
+          type: "CANCEL_ANALYSIS",
+          url: article.url,
+          analysisModel: selectedModel,
+        })
+        .catch(() => {});
+    }
     setAnalysisStartedAt(undefined);
     setLimitDetails(null);
     setError("");
@@ -376,7 +391,7 @@ export default function App() {
         </span>
       </header>
 
-      <div className="flex-1 flex flex-col p-4">
+      <div ref={contentRef} className="flex-1 flex flex-col overflow-y-auto p-4">
         {state === "extracting" && (
           <div className="flex-1 flex items-center justify-center">
             <p className="text-sm text-zinc-500 animate-pulse">
@@ -479,7 +494,7 @@ export default function App() {
         )}
 
         {state === "analyzing" && (
-          <div className="flex-1 flex flex-col items-center justify-center gap-4">
+          <div className="flex-1 w-full flex flex-col items-center justify-center gap-4">
             <AnalysisProgress startedAt={analysisStartedAt} />
             <button
               onClick={cancelAnalysis}

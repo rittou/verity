@@ -119,7 +119,7 @@ const GEMINI_URL_BASE =
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
-const MAX_RETRIES = 3;
+const MAX_RETRIES = 1;
 const MAX_ARTICLE_CHARS = 3600;
 const MAX_CLAIMS = 5;
 
@@ -1055,15 +1055,10 @@ async function analyzeWithModel(
   },
 ) {
   const { url, title, body, mediaSummary } = input;
-  let claimTexts = await decomposeClaims(title, body, model);
+  const claimTexts = await decomposeClaims(title, body, model);
 
   if (claimTexts.length === 0) {
-    console.warn("decomposeClaims returned 0 claims, retrying once");
-    claimTexts = await decomposeClaims(title, body, model);
-  }
-
-  if (claimTexts.length === 0) {
-    console.warn("No verifiable claims extracted after retry; continuing with tone-only analysis.");
+    console.warn("No verifiable claims extracted; skipping further model calls for efficiency.");
   }
 
   const evaluatedClaims = await evaluateClaims(claimTexts, model);
@@ -1100,13 +1095,15 @@ async function analyzeWithModel(
   });
 
   let toneAlerts: ToneAlert[] = [];
-  try {
-    toneAlerts = await detectTone(title, body, model);
-  } catch (err) {
-    if (err instanceof ModelLimitError) {
-      console.warn("[Verity][tone-skip-limit]", err.toDiagnostic());
-    } else {
-      console.error("Tone detection failed (non-fatal):", err);
+  if (claimTexts.length > 0) {
+    try {
+      toneAlerts = await detectTone(title, body, model);
+    } catch (err) {
+      if (err instanceof ModelLimitError) {
+        console.warn("[Verity][tone-skip-limit]", err.toDiagnostic());
+      } else {
+        console.error("Tone detection failed (non-fatal):", err);
+      }
     }
   }
 

@@ -11,6 +11,7 @@ const PROXY_URL = __PROXY_URL__;
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const inFlightAnalyses = new Map<string, Promise<AnalysisResult>>();
 const inFlightStartTimes = new Map<string, number>();
+const inFlightControllers = new Map<string, AbortController>();
 
 interface CachedAnalysisEntry {
   result: AnalysisResult;
@@ -138,6 +139,7 @@ async function analyzeArticle(
   article: ArticleData,
   forceRefresh = false,
   analysisModel = "gemini-grounded",
+  signal?: AbortSignal,
 ): Promise<AnalysisResult> {
   if (forceRefresh) {
     await clearCachedResult(article.url, analysisModel);
@@ -149,6 +151,7 @@ async function analyzeArticle(
   const response = await fetch(`${PROXY_URL}/api/check`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal,
     body: JSON.stringify({
       url: article.url,
       title: article.title,
@@ -208,11 +211,19 @@ chrome.runtime.onMessage.addListener(
 
       if (shouldStartNew) {
         inFlightStartTimes.set(key, Date.now());
-        const promise = analyzeArticle(message.data, forceRefresh, analysisModel)
+        const controller = new AbortController();
+        inFlightControllers.set(key, controller);
+        const promise = analyzeArticle(
+          message.data,
+          forceRefresh,
+          analysisModel,
+          controller.signal,
+        )
           .finally(() => {
             if (inFlightAnalyses.get(key) === promise) {
               inFlightAnalyses.delete(key);
               inFlightStartTimes.delete(key);
+              inFlightControllers.delete(key);
             }
           });
         inFlightAnalyses.set(key, promise);
@@ -230,6 +241,17 @@ chrome.runtime.onMessage.addListener(
             details: err.details || null,
           }),
         );
+      return true;
+    }
+
+    if (message.type === "CANCEL_ANALYSIS" && message.url) {
+      const analysisModel = message.analysisModel || "gemini-grounded";
+      const key = inFlightKey(message.url, analysisModel);
+      inFlightControllers.get(key)?.abort();
+      inFlightControllers.delete(key);
+      inFlightAnalyses.delete(key);
+      inFlightStartTimes.delete(key);
+      sendResponse({ cancelled: true });
       return true;
     }
 
