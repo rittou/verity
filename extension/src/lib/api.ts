@@ -15,6 +15,7 @@ export function getProxyUrl(): string {
 
 export async function analyzeArticle(
   article: ArticleData,
+  analysisModel = "gemini-grounded",
 ): Promise<AnalysisResult> {
   const response = await fetch(`${PROXY_URL}/api/check`, {
     method: "POST",
@@ -23,6 +24,8 @@ export async function analyzeArticle(
       url: article.url,
       title: article.title,
       body: article.body,
+      mediaSummary: article.mediaSummary,
+      analysisModel,
     }),
   });
 
